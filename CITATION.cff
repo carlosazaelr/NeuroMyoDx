@@ -1,8 +1,8 @@
 # This CITATION.cff file was generated with cffinit.
 # Visit https://bit.ly/cffinit to generate yours today!
 
-cff-version: 1.2.0
-title: 'MATLAB, SPYDER'
+cff-version: 1.0.0
+title: 'SPYDER'
 message: >-
   If you use this software, please cite it using the
   metadata from this file.
@@ -12,11 +12,11 @@ authors:
     family-names: Ramirez
     email: L22212267@tectijuana.edu.mx
     affiliation: TecNM-ITT
-repository-code: 'https://github.com/carlosazaelr/Practica1MSF'
+repository-code: 'https://github.com/carlosazaelr/NeuroMyoDx'
 keywords:
-  - Circuito RLC
-  - Controlador PID
-  - Sistema respiratorio
-  - Modelo matemático
-  - Simulaciones numéricas
+  - Esclerosis Lateral Amiotrófica
+  - electromiografía intramuscular
+  - aprendizaje automático
+  - transformada Wavelet
+  - soporte a la decisión clínica
 license: BSD-2-Clause
