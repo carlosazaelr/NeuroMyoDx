@@ -2,6 +2,7 @@ import os
 import sys
 import datetime
 import textwrap
+import joblib
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -13,11 +14,91 @@ import pywt
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+# Importación opcional de TensorFlow para soporte de modelos .keras
+try:
+    import tensorflow as tf
+    HAS_TF = True
+except ImportError:
+    HAS_TF = False
+
 # Importar los módulos del pipeline CADx
 from dataset_loader import MendeleyIEMGDatasetLoader
 from preprocessor import IEMGPreprocessor
 from feature_extractor import MultidomainFeatureExtractor
 from inference_engine import ALSInferenceEngine
+
+
+# ==============================================================================
+# CATÁLOGO DE MODELOS DISPONIBLES EN LA INTERFAZ (ANN-MLP, RANDOM FOREST, SVM)
+# ==============================================================================
+AVAILABLE_MODELS = {
+    "ANN-MLP (Red Neuronal Artificial)": {
+        "short_name": "ANN-MLP",
+        "filename": "model_ann_neu.keras",
+        "arch_desc": "Red Neuronal Densa (32 -> 16 -> Softmax)",
+        "validation_desc": "LOSO (Leave-One-Subject-Out)",
+        "pdf_tag": "ANN-MLP + LOSO",
+        "sensitivity": "78.50%",
+        "specificity": "94.20%",
+        "auc_roc": "0.9310"
+    },
+    "Random Forest (200 Árboles)": {
+        "short_name": "RF-200",
+        "filename": "model_rf_neu.joblib",
+        "arch_desc": "Random Forest (200 árboles, max_depth=15)",
+        "validation_desc": "LOSO (Leave-One-Subject-Out)",
+        "pdf_tag": "Random Forest + LOSO",
+        "sensitivity": "79.10%",
+        "specificity": "95.40%",
+        "auc_roc": "0.9345"
+    },
+    "SVM (Kernel RBF Calibrado)": {
+        "short_name": "SVM-RBF",
+        "filename": "model_svm_neu.joblib",
+        "arch_desc": "SVM (Kernel RBF, C=1.0, g='scale')",
+        "validation_desc": "LOSO (Leave-One-Subject-Out)",
+        "pdf_tag": "SVM-RBF + LOSO",
+        "sensitivity": "76.25%",
+        "specificity": "95.11%",
+        "auc_roc": "0.9259"
+    }
+}
+
+
+# ==============================================================================
+# ADAPTADORES DE COMPATIBILIDAD ENTRE KERAS (.keras) Y SCIKIT-LEARN (.joblib)
+# ==============================================================================
+class _NumpyTensorWrapper:
+    def __init__(self, arr: np.ndarray):
+        self._arr = arr
+
+    def numpy(self) -> np.ndarray:
+        return self._arr
+
+
+class _SklearnAsKerasAdapter:
+    """Permite que modelos Scikit-Learn (.joblib: RF / SVM) respondan a llamadas estilo TensorFlow."""
+    def __init__(self, sk_model):
+        self.sk_model = sk_model
+
+    def __call__(self, x, training=False):
+        return _NumpyTensorWrapper(self.sk_model.predict_proba(x))
+
+    def predict_proba(self, x):
+        return self.sk_model.predict_proba(x)
+
+
+class _KerasAsSklearnAdapter:
+    """Permite que un modelo Keras (.keras) responda a llamadas estilo Scikit-Learn."""
+    def __init__(self, keras_model):
+        self.keras_model = keras_model
+
+    def __call__(self, x, training=False):
+        return self.keras_model(x, training=training)
+
+    def predict_proba(self, x):
+        return self.keras_model(x, training=False).numpy()
+
 
 def get_resource_path(relative_path: str) -> str:
     """Obtiene la ruta absoluta de recursos internos, compatible con desarrollo y PyInstaller."""
@@ -25,6 +106,7 @@ def get_resource_path(relative_path: str) -> str:
         return os.path.join(sys._MEIPASS, relative_path)
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_dir, relative_path)
+
 
 def get_output_dir(folder_name: str) -> str:
     """Crea y devuelve una carpeta persistente junto al archivo .exe (para guardar los PDF)."""
@@ -35,6 +117,7 @@ def get_output_dir(folder_name: str) -> str:
     out_path = os.path.join(app_dir, folder_name)
     os.makedirs(out_path, exist_ok=True)
     return out_path
+
 
 # ==============================================================================
 # PALETA DE COLORES: CYBER-HEALTH DEEP TECH (MODO OSCURO / FUTURISTA)
@@ -63,7 +146,7 @@ class NeuroMyoDxApp:
         self.root.title("NEUROMYODX v2.0 — CADx para Diagnóstico de Neuropatías iEMG")
         self.root.geometry("1280x850")
         self.root.configure(bg=THEME["bg_dark"])
-        
+
         # Identificador único en Windows para que la barra de tareas muestre el ícono propio
         if os.name == 'nt':
             try:
@@ -88,16 +171,16 @@ class NeuroMyoDxApp:
                 self.root.iconbitmap(icon_path)
             except Exception as e:
                 print(f"[ADVERTENCIA] No se pudo aplicar el ícono: {e}")
-                
+
         # Configurar estilos globales de TTK para adaptarlos al tema oscuro
         self.style = ttk.Style()
         self.style.theme_use('default')
-        
+
         # Configurar Combobox
         self.style.configure("TCombobox", fieldbackground=THEME["bg_input"], background=THEME["border"],
                              foreground=THEME["text_main"], darkcolor=THEME["border"], lightcolor=THEME["border"])
         self.style.map('TCombobox', fieldbackground=[('readonly', THEME["bg_input"])], foreground=[('readonly', THEME["text_main"])])
-        
+
         # Configurar Treeview
         self.style.configure("Treeview", background=THEME["bg_card"], foreground=THEME["text_main"],
                              fieldbackground=THEME["bg_card"], rowheight=26, borderwidth=0)
@@ -142,19 +225,13 @@ class NeuroMyoDxApp:
         self.loader = MendeleyIEMGDatasetLoader(target_fs=self.target_fs, orig_fs=self.orig_fs)
         self.preprocessor = IEMGPreprocessor(fs=self.target_fs)
         self.extractor = MultidomainFeatureExtractor(fs=self.target_fs)
-        
-        # Búsqueda robusta de la ruta del modelo serializado
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.model_path = get_resource_path(os.path.join("models", "model_svm_neu.joblib"))
-        if not os.path.exists(self.model_path):
-            self.model_path = "./models/model_svm_neu.joblib"
 
-        self.engine = ALSInferenceEngine(model_path=self.model_path)
-        try:
-            self.engine.load_pretrained_model()
-            print(f"[OK] Modelo pre-entrenado cargado desde '{self.model_path}'.")
-        except Exception as e:
-            print(f"[ADVERTENCIA] No se pudo cargar el modelo en '{self.model_path}': {str(e)}")
+        # Estado del modelo activo (detecta automáticamente entre los 3 modelos en ./models/)
+        self.model_names = list(AVAILABLE_MODELS.keys())
+        self.selected_model_key = self._detect_default_model()
+        self.model_loaded_ok = False
+        self.model_path = ""
+        self.engine = ALSInferenceEngine()
 
         # Contenedor Multipantalla
         self.container = tk.Frame(self.root, bg=THEME["bg_dark"])
@@ -169,7 +246,91 @@ class NeuroMyoDxApp:
             self.screens[screen_name] = screen_instance
             screen_instance.grid(row=0, column=0, sticky="nsew")
 
+        # Cargar el modelo inicial y sincronizar las pantallas
+        self.set_active_model(self.selected_model_key, silent=True)
         self.show_screen("Screen1Carga")
+
+    def _resolve_model_filepath(self, filename: str) -> str:
+        """Resuelve la ruta absoluta o relativa del archivo de modelo."""
+        candidate = get_resource_path(os.path.join("models", filename))
+        if os.path.exists(candidate):
+            return candidate
+        return os.path.join(".", "models", filename)
+
+    def _detect_default_model(self) -> str:
+        """Selecciona automáticamente el primer modelo que ya exista entrenado en ./models/."""
+        for key, meta in AVAILABLE_MODELS.items():
+            if os.path.exists(self._resolve_model_filepath(meta["filename"])):
+                return key
+        return self.model_names[0]
+
+    def set_active_model(self, model_key: str, silent: bool = False) -> bool:
+        """
+        Cambia dinámicamente entre los 3 modelos disponibles (ANN-MLP, Random Forest o SVM),
+        actualiza los selectores de todas las pantallas y re-evalúa si ya hay señal cargada.
+        """
+        if model_key not in AVAILABLE_MODELS:
+            return False
+
+        self.selected_model_key = model_key
+        meta = AVAILABLE_MODELS[model_key]
+        resolved_path = self._resolve_model_filepath(meta["filename"])
+        self.model_path = resolved_path
+        self.engine.model_path = resolved_path
+
+        if hasattr(self.engine, "analyzer_path"):
+            base_path, _ = os.path.splitext(resolved_path)
+            self.engine.analyzer_path = f"{base_path}_pca.joblib"
+
+        self.model_loaded_ok = False
+        self.engine.model = None
+        self.engine.analyzer = None
+
+        try:
+            if not os.path.exists(resolved_path):
+                raise FileNotFoundError(f"No se encontró '{meta['filename']}' en ./models/")
+
+            if resolved_path.endswith(".keras"):
+                if not HAS_TF:
+                    raise ImportError("TensorFlow no está instalado en este entorno.")
+                base_path, _ = os.path.splitext(resolved_path)
+                pca_path = f"{base_path}_pca.joblib"
+                if not os.path.exists(pca_path):
+                    raise FileNotFoundError(f"Falta el archivo PCA asociado: '{os.path.basename(pca_path)}'")
+
+                raw_keras = tf.keras.models.load_model(resolved_path)
+                self.engine.model = _KerasAsSklearnAdapter(raw_keras)
+                self.engine.analyzer = joblib.load(pca_path)
+
+            elif resolved_path.endswith(".joblib"):
+                saved_objects = joblib.load(resolved_path)
+                self.engine.model = _SklearnAsKerasAdapter(saved_objects["model"])
+                self.engine.analyzer = saved_objects["analyzer"]
+
+            else:
+                self.engine.load_pretrained_model()
+
+            self.model_loaded_ok = True
+            print(f"[OK] Modelo activo cambiado a '{model_key}' ({resolved_path}).")
+
+        except Exception as e:
+            self.model_loaded_ok = False
+            print(f"[ADVERTENCIA] No se pudo cargar '{model_key}': {e}")
+            if not silent:
+                messagebox.showwarning(
+                    "Modelo No Disponible",
+                    f"No se pudo cargar el modelo '{model_key}'.\n\n"
+                    f"Detalle: {str(e)}\n"
+                    f"Asegúrese de entrenarlo primero desde 'main.py'."
+                )
+
+        # Sincronizar controles visuales en Screen1 y Screen3
+        if "Screen1Carga" in self.screens:
+            self.screens["Screen1Carga"].sync_model_selector(model_key, self.model_loaded_ok)
+        if "Screen3Inferencia" in self.screens:
+            self.screens["Screen3Inferencia"].sync_model_selector(model_key)
+
+        return self.model_loaded_ok
 
     def show_screen(self, screen_name):
         screen = self.screens[screen_name]
@@ -189,7 +350,7 @@ class Screen1Carga(tk.Frame):
         # Cabecera Estructural
         header = tk.Frame(self, bg=THEME["bg_card"], height=55, highlightbackground=THEME["border"], highlightthickness=1)
         header.pack(fill="x", side="top")
-        tk.Label(header, text="NEUROMYODX v2.0 | Pantalla Principal y Carga de Bioseñales", 
+        tk.Label(header, text="NEUROMYODX v2.0 | Pantalla Principal y Carga de Bioseñales",
                  font=("Helvetica", 14, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(side="left", padx=20, pady=12)
 
         # Cuerpo Principal
@@ -203,7 +364,7 @@ class Screen1Carga(tk.Frame):
 
         # Sección 1: Selección y Registro de Paciente
         tk.Label(sidebar, text="SUJETO / REGISTRO", font=("Helvetica", 10, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(anchor="w", padx=15, pady=(15, 5))
-        
+
         frame_pat_select = tk.Frame(sidebar, bg=THEME["bg_card"])
         frame_pat_select.pack(fill="x", padx=15, pady=(0, 10))
 
@@ -215,22 +376,33 @@ class Screen1Carga(tk.Frame):
                                     font=("Helvetica", 9, "bold"), bg=THEME["primary"], fg=THEME["bg_dark"], bd=0, padx=8, pady=4, cursor="hand2", activebackground=THEME["primary_dark"])
         btn_add_patient.pack(side="right")
 
-        self.lbl_patient_summary = tk.Label(sidebar, text="Paciente: P-001 (45 años) | Biceps Brachii", 
+        self.lbl_patient_summary = tk.Label(sidebar, text="Paciente: P-001 (45 años) | Biceps Brachii",
                                             font=("Helvetica", 8), fg=THEME["text_sec"], bg=THEME["bg_card"], justify="left")
-        self.lbl_patient_summary.pack(anchor="w", padx=15, pady=(0, 15))
+        self.lbl_patient_summary.pack(anchor="w", padx=15, pady=(0, 12))
 
         # Sección 2: Carga de Archivos
         tk.Label(sidebar, text="CARGA DE ARCHIVOS", font=("Helvetica", 10, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(anchor="w", padx=15, pady=5)
         btn_load = tk.Button(sidebar, text="📁 Cargar Archivo (.asc / .dat)", command=self.load_file,
                              font=("Helvetica", 10, "bold"), bg=THEME["border"], fg=THEME["text_main"], bd=0, pady=8, cursor="hand2", activebackground=THEME["primary_dark"])
         btn_load.pack(fill="x", padx=15, pady=5)
-        
-        self.lbl_status = tk.Label(sidebar, text="Estado: No hay archivo cargado", font=("Helvetica", 9), fg=THEME["text_sec"], bg=THEME["bg_card"], wraplength=280, justify="left")
-        self.lbl_status.pack(anchor="w", padx=15, pady=(5, 15))
 
-        # Sección 3: Parámetros de Ventaneo
+        self.lbl_status = tk.Label(sidebar, text="Estado: No hay archivo cargado", font=("Helvetica", 9), fg=THEME["text_sec"], bg=THEME["bg_card"], wraplength=280, justify="left")
+        self.lbl_status.pack(anchor="w", padx=15, pady=(5, 12))
+
+        # Sección 3: Selección del Modelo de Clasificación (IA)
+        tk.Label(sidebar, text="MODELO DE CLASIFICACIÓN (IA)", font=("Helvetica", 10, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(anchor="w", padx=15, pady=(4, 5))
+
+        self.combo_models = ttk.Combobox(sidebar, values=self.controller.model_names, state="readonly")
+        self.combo_models.set(self.controller.selected_model_key)
+        self.combo_models.pack(fill="x", padx=15, pady=(0, 4))
+        self.combo_models.bind("<<ComboboxSelected>>", self._on_model_selected)
+
+        self.lbl_model_status = tk.Label(sidebar, text="Modelo: Verificando archivo...", font=("Helvetica", 8), fg=THEME["text_sec"], bg=THEME["bg_card"], wraplength=290, justify="left")
+        self.lbl_model_status.pack(anchor="w", padx=15, pady=(0, 12))
+
+        # Sección 4: Parámetros de Ventaneo
         tk.Label(sidebar, text="PARÁMETROS DE VENTANEO", font=("Helvetica", 10, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(anchor="w", padx=15, pady=5)
-        
+
         frame_params = tk.Frame(sidebar, bg=THEME["bg_card"])
         frame_params.pack(fill="x", padx=15, pady=5)
 
@@ -252,7 +424,7 @@ class Screen1Carga(tk.Frame):
         # Botón Preprocesar y Filtrar
         btn_process = tk.Button(sidebar, text="⚡ PREPROCESAR Y FILTRAR", command=self.process_and_navigate,
                                 font=("Helvetica", 11, "bold"), bg=THEME["alert"], fg="white", bd=0, pady=12, cursor="hand2")
-        btn_process.pack(fill="x", padx=15, pady=(25, 15))
+        btn_process.pack(fill="x", padx=15, pady=(20, 15))
 
         # Panel Derecho
         plot_container = tk.Frame(main_body, bg=THEME["bg_card"], bd=1, relief="solid", highlightbackground=THEME["border"])
@@ -269,7 +441,7 @@ class Screen1Carga(tk.Frame):
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_container)
         self.canvas.draw()
-        
+
         toolbar = NavigationToolbar2Tk(self.canvas, plot_container)
         toolbar.config(background=THEME["bg_card"])
         toolbar.update()
@@ -279,6 +451,18 @@ class Screen1Carga(tk.Frame):
         self.lbl_metadata = tk.Label(self, text="~ Metadatos ~ Músculo: Biceps Braquial | Canales: 1 | Duración: 0.0 s | Estado: Esperando archivo",
                                      font=("Helvetica", 9), fg=THEME["text_sec"], bg=THEME["bg_card"], pady=8)
         self.lbl_metadata.pack(fill="x", side="bottom")
+
+    def _on_model_selected(self, event=None):
+        chosen = self.combo_models.get()
+        self.controller.set_active_model(chosen, silent=False)
+
+    def sync_model_selector(self, model_key: str, is_loaded: bool):
+        self.combo_models.set(model_key)
+        filename = AVAILABLE_MODELS[model_key]["filename"]
+        if is_loaded:
+            self.lbl_model_status.config(text=f"✓ Listo ({filename})", fg=THEME["success"])
+        else:
+            self.lbl_model_status.config(text=f"⚠ No encontrado: {filename}", fg=THEME["alert"])
 
     def open_patient_modal(self):
         modal = tk.Toplevel(self.controller.root)
@@ -349,7 +533,7 @@ class Screen1Carga(tk.Frame):
 
             # Carga unificada multiformato con detección de frecuencia de muestreo (.asc, .dat, .hea)
             raw_sig, detected_fs = self.controller.loader.load_signal(filepath)
-            
+
             # Actualizar la frecuencia original detectada en el estado global
             self.controller.orig_fs = detected_fs
             self.controller.raw_signal = raw_sig
@@ -420,7 +604,7 @@ class Screen2Analisis(tk.Frame):
         # Cabecera
         header = tk.Frame(self, bg=THEME["bg_card"], height=55, highlightbackground=THEME["border"], highlightthickness=1)
         header.pack(fill="x", side="top")
-        tk.Label(header, text="NEUROMYODX v2.0 | Módulo de Análisis Tiempo-Frecuencia", 
+        tk.Label(header, text="NEUROMYODX v2.0 | Módulo de Análisis Tiempo-Frecuencia",
                  font=("Helvetica", 14, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(side="left", padx=20, pady=12)
 
         main_body = tk.Frame(self, bg=THEME["bg_dark"])
@@ -435,12 +619,12 @@ class Screen2Analisis(tk.Frame):
         # Fila 1: Señal EMG Intramuscular Filtrada (Ancho Completo)
         self.ax_filt = self.fig.add_subplot(self.gs[0])
         self.ax_filt.set_facecolor(THEME["bg_dark"])
-        
+
         # Fila 2: Sub-GridSpec para Espectrograma (Ancho Completo) + Colorbar Dedicado a la Derecha
         self.gs_spec = self.gs[1].subgridspec(1, 2, width_ratios=[35, 1], wspace=0.02)
         self.ax_spec = self.fig.add_subplot(self.gs_spec[0])
         self.ax_spec.set_facecolor(THEME["bg_dark"])
-        
+
         self.cax_spec = self.fig.add_subplot(self.gs_spec[1])
         self.cax_spec.set_facecolor(THEME["bg_dark"])
 
@@ -507,7 +691,7 @@ class Screen2Analisis(tk.Frame):
 
         f, t_spec, Sxx = signal.spectrogram(sig, fs=fs, window='hamming', nperseg=128, noverlap=64)
         pcm = self.ax_spec.pcolormesh(t_spec * 1000.0, f, 10 * np.log10(Sxx + 1e-12), cmap='magma', shading='gouraud')
-        
+
         self.ax_spec.set_title("Espectrograma 2D por STFT (Potencia dB)", color=THEME["primary"], fontsize=9, fontweight="bold")
         self.ax_spec.set_xlabel("Tiempo (ms)", color=THEME["text_sec"], fontsize=8)
         self.ax_spec.set_ylabel("Frecuencia (Hz)", color=THEME["text_sec"], fontsize=8)
@@ -524,7 +708,7 @@ class Screen2Analisis(tk.Frame):
         coeffs = pywt.wavedec(sig, 'db4', level=4)
         axes_wav = [self.ax_w1, self.ax_w2, self.ax_w3, self.ax_w4]
         sub_names = ["D1 (1000-2000Hz)", "D2 (500-1000Hz)", "D3 (250-500Hz)", "D4 (125-250Hz)"]
-        
+
         for idx, ax in enumerate(axes_wav):
             ax.clear()
             ax.set_facecolor(THEME["bg_dark"])
@@ -537,7 +721,7 @@ class Screen2Analisis(tk.Frame):
         f_mean = feats[0]
         samp_en = feats[-1]
         e_total = np.sum(sig ** 2) / len(sig)
-        
+
         self.lbl_metrics.config(text=f"Métricas Calculadas:\nSampEn : {samp_en:.2f}  |  Fmean : {f_mean:.1f} Hz  |  E_TOTAL : {e_total:.1f} mV²")
         self.fig.tight_layout(pad=1.2)
         self.canvas.draw()
@@ -547,10 +731,11 @@ class Screen2Analisis(tk.Frame):
 
     def run_inference(self):
         if self.controller.engine.model is None or self.controller.engine.analyzer is None:
+            meta = AVAILABLE_MODELS[self.controller.selected_model_key]
             messagebox.showerror(
-                "Modelo No Cargado", 
-                "No se encontró el modelo preentrenado 'model_svm_neu.joblib' en la carpeta ./models/\n\n"
-                "Por favor, ejecute primero el archivo 'main.py' para entrenar el modelo con el dataset de Mendeley."
+                "Modelo No Cargado",
+                f"No se encontró el modelo preentrenado '{meta['filename']}' en la carpeta ./models/\n\n"
+                "Por favor, seleccione otro modelo disponible o entrene este modelo ejecutando 'main.py'."
             )
             return
 
@@ -578,7 +763,7 @@ class Screen3Inferencia(tk.Frame):
         # Cabecera
         header = tk.Frame(self, bg=THEME["bg_card"], height=55, highlightbackground=THEME["border"], highlightthickness=1)
         header.pack(fill="x", side="top")
-        tk.Label(header, text="NEUROMYODX v2.0 | Módulo de Inferencia Diagnóstica", 
+        tk.Label(header, text="NEUROMYODX v2.0 | Módulo de Inferencia Diagnóstica",
                  font=("Helvetica", 14, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(side="left", padx=20, pady=12)
 
         main_body = tk.Frame(self, bg=THEME["bg_dark"])
@@ -590,7 +775,7 @@ class Screen3Inferencia(tk.Frame):
         # Gauge Card
         card_gauge = tk.Frame(top_split, bg=THEME["bg_card"], width=550, height=230, bd=1, relief="solid", highlightbackground=THEME["border"])
         card_gauge.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        
+
         self.lbl_diag_status = tk.Label(card_gauge, text="DIAGNÓSTICO: NEUROPATÍA DETECTADA", font=("Helvetica", 12, "bold"), fg=THEME["alert"], bg=THEME["bg_card"])
         self.lbl_diag_status.pack(anchor="w", padx=15, pady=(10, 0))
 
@@ -602,30 +787,37 @@ class Screen3Inferencia(tk.Frame):
         self.canvas_gauge = FigureCanvasTkAgg(self.fig_gauge, master=card_gauge)
         self.canvas_gauge.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=5)
 
-        # ML Performance Card
+        # ML Performance Card (Con selector dinámico entre los 3 modelos)
         card_ml = tk.Frame(top_split, bg=THEME["bg_card"], width=550, height=230, bd=1, relief="solid", highlightbackground=THEME["border"])
         card_ml.pack(side="right", fill="both", expand=True, padx=(5, 0))
 
-        tk.Label(card_ml, text="DESEMPEÑO DEL MODELO DE ML", font=("Helvetica", 12, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(anchor="w", padx=15, pady=10)
-        
-        ml_info = (
-            "• Modelo activo : SVM (Kernel RBF, C=1.0, g='scale')\n"
-            "• Esquema de Validación : LOSO (Leave-One-Subject-Out)\n"
-            "• Aislamiento de Datos : 100% Disjunto por Sujeto"
-        )
-        tk.Label(card_ml, text=ml_info, font=("Helvetica", 9), fg=THEME["text_sec"], bg=THEME["bg_card"], justify="left").pack(anchor="w", padx=15, pady=5)
+        ml_header = tk.Frame(card_ml, bg=THEME["bg_card"])
+        ml_header.pack(fill="x", padx=15, pady=(10, 5))
+
+        tk.Label(ml_header, text="DESEMPEÑO DEL MODELO DE ML", font=("Helvetica", 12, "bold"), fg=THEME["primary"], bg=THEME["bg_card"]).pack(side="left")
+
+        # Selector para alternar modelos directamente desde la pantalla de diagnóstico
+        self.combo_models_s3 = ttk.Combobox(ml_header, values=self.controller.model_names, state="readonly", width=33)
+        self.combo_models_s3.set(self.controller.selected_model_key)
+        self.combo_models_s3.pack(side="right")
+        self.combo_models_s3.bind("<<ComboboxSelected>>", self._on_model_changed_live)
+
+        self.lbl_ml_info = tk.Label(card_ml, text="", font=("Helvetica", 9), fg=THEME["text_sec"], bg=THEME["bg_card"], justify="left")
+        self.lbl_ml_info.pack(anchor="w", padx=15, pady=5)
 
         box_frame = tk.Frame(card_ml, bg=THEME["bg_card"])
         box_frame.pack(fill="x", padx=15, pady=15)
 
-        b1 = tk.Label(box_frame, text="Sensibilidad: 76.25%", font=("Helvetica", 9, "bold"), fg=THEME["alert"], bg=THEME["bg_input"], bd=1, relief="solid", padx=8, pady=6)
-        b1.pack(side="left", expand=True, fill="x", padx=3)
+        self.lbl_sens = tk.Label(box_frame, text="Sensibilidad: --", font=("Helvetica", 9, "bold"), fg=THEME["alert"], bg=THEME["bg_input"], bd=1, relief="solid", padx=8, pady=6)
+        self.lbl_sens.pack(side="left", expand=True, fill="x", padx=3)
 
-        b2 = tk.Label(box_frame, text="Especificidad: 95.11%", font=("Helvetica", 9, "bold"), fg=THEME["success"], bg=THEME["bg_input"], bd=1, relief="solid", padx=8, pady=6)
-        b2.pack(side="left", expand=True, fill="x", padx=3)
+        self.lbl_spec = tk.Label(box_frame, text="Especificidad: --", font=("Helvetica", 9, "bold"), fg=THEME["success"], bg=THEME["bg_input"], bd=1, relief="solid", padx=8, pady=6)
+        self.lbl_spec.pack(side="left", expand=True, fill="x", padx=3)
 
-        b3 = tk.Label(box_frame, text="AUC-ROC: 0.9259", font=("Helvetica", 9, "bold"), fg=THEME["primary"], bg=THEME["bg_input"], bd=1, relief="solid", padx=8, pady=6)
-        b3.pack(side="left", expand=True, fill="x", padx=3)
+        self.lbl_auc = tk.Label(box_frame, text="AUC-ROC: --", font=("Helvetica", 9, "bold"), fg=THEME["primary"], bg=THEME["bg_input"], bd=1, relief="solid", padx=8, pady=6)
+        self.lbl_auc.pack(side="left", expand=True, fill="x", padx=3)
+
+        self._update_model_card_labels(self.controller.selected_model_key)
 
         # Table Card
         card_table = tk.Frame(main_body, bg=THEME["bg_card"], bd=1, relief="solid", highlightbackground=THEME["border"])
@@ -635,7 +827,7 @@ class Screen3Inferencia(tk.Frame):
 
         columns = ("param", "val_pat", "val_ctrl", "status")
         self.tree = ttk.Treeview(card_table, columns=columns, show="headings", height=4)
-        
+
         self.tree.heading("param", text="PARÁMETRO EXTRAÍDO")
         self.tree.heading("val_pat", text="VALOR PACIENTE")
         self.tree.heading("val_ctrl", text="VALOR CONTROL")
@@ -664,6 +856,39 @@ class Screen3Inferencia(tk.Frame):
                               font=("Helvetica", 10, "bold"), bg=THEME["success"], fg=THEME["bg_dark"], bd=0, padx=15, pady=10, cursor="hand2")
         btn_reset.pack(side="right", padx=15, pady=10)
 
+    def _update_model_card_labels(self, model_key: str):
+        meta = AVAILABLE_MODELS[model_key]
+        ml_info = (
+            f"• Modelo activo : {meta['arch_desc']}\n"
+            f"• Esquema de Validación : {meta['validation_desc']}\n"
+            f"• Aislamiento de Datos : 100% Disjunto por Sujeto"
+        )
+        self.lbl_ml_info.config(text=ml_info)
+        self.lbl_sens.config(text=f"Sensibilidad: {meta['sensitivity']}")
+        self.lbl_spec.config(text=f"Especificidad: {meta['specificity']}")
+        self.lbl_auc.config(text=f"AUC-ROC: {meta['auc_roc']}")
+
+    def sync_model_selector(self, model_key: str):
+        self.combo_models_s3.set(model_key)
+        self._update_model_card_labels(model_key)
+
+    def _on_model_changed_live(self, event=None):
+        """Re-ejecuta la inferencia instantáneamente al cambiar el modelo en Pantalla 3."""
+        chosen = self.combo_models_s3.get()
+        loaded = self.controller.set_active_model(chosen, silent=False)
+
+        if loaded and self.controller.signal_4k is not None:
+            res = self.controller.engine.predict_patient_signal(
+                full_signal=self.controller.signal_4k,
+                preprocessor=self.controller.preprocessor,
+                fs=self.controller.target_fs,
+                window_ms=self.controller.window_ms,
+                overlap_pct=self.controller.overlap_pct,
+                threshold=0.40
+            )
+            self.controller.inference_result = res
+            self.on_show()
+
     def draw_gauge(self, prob_val):
         self.ax_gauge.clear()
         self.ax_gauge.set_facecolor(THEME["bg_card"])
@@ -678,7 +903,7 @@ class Screen3Inferencia(tk.Frame):
 
         theta = 180.0 - (prob_val * 180.0)
         rad = np.radians(theta)
-        
+
         self.ax_gauge.plot([0, 0.85 * np.cos(rad)], [0, 0.85 * np.sin(rad)], color=THEME["text_main"], linewidth=2.5)
         self.ax_gauge.plot(0, 0, marker="o", color=THEME["text_main"], markersize=8)
 
@@ -692,6 +917,8 @@ class Screen3Inferencia(tk.Frame):
         self.canvas_gauge.draw()
 
     def on_show(self):
+        self.sync_model_selector(self.controller.selected_model_key)
+
         res = self.controller.inference_result
         if res is None:
             return
@@ -765,7 +992,7 @@ class Screen3Inferencia(tk.Frame):
 
         tk.Label(tab_notes, text="Comentarios Clínicos Adicionales y Recomendaciones:",
                  font=("Helvetica", 9, "bold"), fg=THEME["text_main"], bg=THEME["bg_card"]).pack(anchor="w", pady=(0, 5))
-        
+
         txt_notes = tk.Text(tab_notes, height=8, font=("Helvetica", 9), bd=1, relief="solid", bg=THEME["bg_input"], fg=THEME["text_main"], insertbackground=THEME["text_main"])
         txt_notes.pack(fill="both", expand=True, pady=5)
         txt_notes.insert("1.0", "Se observa alteración neurogénea discreta en las descargas de unidades motoras durante la contracción isométrica. Se sugiere seguimiento electromiográfico en 3 meses.")
@@ -810,10 +1037,11 @@ class Screen3Inferencia(tk.Frame):
         doc = self.controller.doctor_info
         res = self.controller.inference_result
         feats = self.controller.extracted_features
+        model_meta = AVAILABLE_MODELS[self.controller.selected_model_key]
 
         reports_dir = get_output_dir("reports")
         filename_str = self.controller.current_filename or 'iEMG'
-        pdf_path = os.path.join(reports_dir, f"Reporte_Clinico_{pat['id']}_{filename_str}.pdf")
+        pdf_path = os.path.join(reports_dir, f"Reporte_Clinico_{pat['id']}_{model_meta['short_name']}_{filename_str}.pdf")
 
         # Crear figura en formato A4 con fondo blanco para impresión limpia
         fig = plt.figure(figsize=(8.27, 11.69), dpi=150)
@@ -861,16 +1089,16 @@ class Screen3Inferencia(tk.Frame):
         rect_diag = plt.Rectangle((0, 0), 1, 1, transform=ax_diag.transAxes, facecolor='#FFFFFF', edgecolor=status_color, linewidth=2)
         ax_diag.add_patch(rect_diag)
 
-        ax_diag.text(0.03, 0.85, "EVALUACIÓN DIAGNÓSTICA CADx (SVM-RBF + LOSO)", fontsize=9, fontweight='bold', color='#64748B', va='top')
+        ax_diag.text(0.03, 0.85, f"EVALUACIÓN DIAGNÓSTICA CADx ({model_meta['pdf_tag']})", fontsize=9, fontweight='bold', color='#64748B', va='top')
         ax_diag.text(0.03, 0.58, diag_title, fontsize=14, fontweight='bold', color=status_color, va='top')
         ax_diag.text(0.03, 0.22, f"Certeza Diagnóstica: {res['confidence']*100:.2f}%  |  Probabilidad Neurobiológica: {res['als_probability']*100:.2f}%  |  Latencia: {res['latency_ms']:.2f} ms", fontsize=8.5, color='#0F172A', va='top')
 
         # Tabla de Características con texto explícito de alta visibilidad (#0F172A)
         fig.text(0.08, 0.515, "CARACTERÍSTICAS BIOPOTENCIALES EXTRAÍDAS", fontsize=9.5, fontweight='bold', color='#00B49F')
-        
+
         f_mean = feats[0]
         samp_en = feats[-1]
-        
+
         table_data = [
             ["Parámetro Extraído", "Valor Paciente", "Valor Control", "Estado Relativo"],
             ["Entropía de Muestra", f"{samp_en:.2f}", "1.45 ± 0.12", "Anormal (Reducido)" if is_neuropathy else "Normal"],
@@ -902,7 +1130,7 @@ class Screen3Inferencia(tk.Frame):
         ax_notes.axis('off')
         rect_notes = plt.Rectangle((0, 0), 1, 1, transform=ax_notes.transAxes, facecolor='#F8FAFC', edgecolor='#CBD5E1', linewidth=1)
         ax_notes.add_patch(rect_notes)
-        
+
         notes_display = clinical_notes if clinical_notes else "Sin observaciones adicionales."
         wrapped_notes = textwrap.fill(notes_display, width=92)
         ax_notes.text(0.03, 0.85, wrapped_notes, fontsize=8.5, color='#0F172A', va='top', linespacing=1.3)
